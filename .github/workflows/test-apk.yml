@@ -39,10 +39,38 @@ jobs:
       - name: Test and build APK
         run: ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug
 
-      - name: Save test APK
+      - name: Audit final APK manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          AAPT="$ANDROID_HOME/build-tools/37.0.0/aapt"
+          test -f "$APK"
+          test -x "$AAPT"
+          "$AAPT" dump xmltree "$APK" AndroidManifest.xml > manifest-audit.txt
+
+          if grep -Fq "VoiceNotificationListener" manifest-audit.txt; then
+            echo "FAIL: notification listener still present"
+            exit 1
+          fi
+
+          if grep -Fq "android.permission.BIND_NOTIFICATION_LISTENER_SERVICE" manifest-audit.txt; then
+            echo "FAIL: notification listener binding still present"
+            exit 1
+          fi
+
+          grep -Fq "WakeService" manifest-audit.txt
+          grep -Fq "android.permission.RECORD_AUDIO" manifest-audit.txt
+
+          echo "PASS: notification listener removed"
+          echo "PASS: wake service and microphone permission present"
+
+      - name: Save test APK and audit report
         uses: actions/upload-artifact@v7
         with:
           name: GPTWake-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            manifest-audit.txt
           if-no-files-found: error
           retention-days: 7
