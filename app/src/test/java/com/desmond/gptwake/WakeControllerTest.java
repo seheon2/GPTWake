@@ -5,6 +5,8 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 import java.util.ArrayList;
+import java.time.Duration;
+import org.robolectric.shadows.ShadowSystemClock;
 import java.util.List;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -148,9 +150,36 @@ public class WakeControllerTest {
         monitor.when(AudioStateMonitor::isCommunicationMode).thenReturn(false);
         monitor.when(AudioStateMonitor::hasOwnLiveCapture).thenReturn(true);
         controller.onAudioStateChanged("call ended");
+        ShadowSystemClock.advanceBy(Duration.ofSeconds(6));
+        controller.onAudioStateChanged("idle confirmed");
         assertEquals(WakeController.State.KWS_LISTENING, controller.state());
         audio.verify(() -> AudioProbe.start("REACQUIRE"));
         verify(engine).newStream();
+    }
+
+    @Test
+    public void backgroundTransitionDoesNotImmediatelyReacquire() {
+        listen();
+        monitor.when(AudioStateMonitor::isCommunicationMode).thenReturn(true);
+        controller.onAudioStateChanged("manual voice started");
+        monitor.when(AudioStateMonitor::isCommunicationMode).thenReturn(false);
+        controller.onAudioStateChanged("home transition");
+        ShadowSystemClock.advanceBy(Duration.ofSeconds(2));
+        controller.onAudioStateChanged("transient idle");
+        audio.verify(() -> AudioProbe.start("REACQUIRE"), never());
+        monitor.when(AudioStateMonitor::hasOtherCaptureOrUnknown).thenReturn(true);
+        controller.onAudioStateChanged("external capture visible");
+        ShadowSystemClock.advanceBy(Duration.ofSeconds(10));
+        controller.onAudioStateChanged("still recording");
+        audio.verify(() -> AudioProbe.start("REACQUIRE"), never());
+        monitor.when(AudioStateMonitor::hasOtherCaptureOrUnknown).thenReturn(false);
+        controller.onAudioStateChanged("voice ended");
+        audio.verify(() -> AudioProbe.start("REACQUIRE"), never());
+        ShadowSystemClock.advanceBy(Duration.ofSeconds(6));
+        monitor.when(AudioStateMonitor::hasOwnLiveCapture).thenReturn(true);
+        controller.onAudioStateChanged("stable idle");
+        assertEquals(WakeController.State.KWS_LISTENING, controller.state());
+        audio.verify(() -> AudioProbe.start("REACQUIRE"));
     }
 
     @Test
@@ -189,6 +218,8 @@ public class WakeControllerTest {
         monitor.when(AudioStateMonitor::isCommunicationMode).thenReturn(false);
         monitor.when(AudioStateMonitor::hasOwnLiveCapture).thenReturn(true);
         controller.onAudioStateChanged("call ended");
+        ShadowSystemClock.advanceBy(Duration.ofSeconds(6));
+        controller.onAudioStateChanged("idle confirmed");
         verify(engine).configure(argThat(selection -> selection.language == WakeLanguage.JAPANESE
                 && selection.phrase.equals("こんにちは")));
         verify(engine).newStream();
