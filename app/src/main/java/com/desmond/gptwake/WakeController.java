@@ -23,7 +23,8 @@ public final class WakeController implements AudioProbe.WakeListener, AudioState
     private static final long HANDOFF_DRAIN_MS = 250;
     private static final long VOICE_CONFIRM_MS = 5000;
     private static final long DEEPLINK_CONFIRM_MS = 7000;
-    private static final long VOICE_END_DEBOUNCE_MS = 1500;
+    private static final long VOICE_END_DEBOUNCE_MS = 5000;
+    private static final long MIC_GUARD_POLL_MS = 500;
     private static final long REACQUIRE_CONFIRM_MS = 3000;
 
     // Also serializes teardown with the next service instance after a quick Stop/Start.
@@ -39,7 +40,8 @@ public final class WakeController implements AudioProbe.WakeListener, AudioState
     private volatile State state = State.STOPPED;
     private long launchStartedAt;
     private boolean deeplinkTried;
-    private long voiceEndCandidateSince;
+    private long voiceEndCandidateSince = -1;
+    private long micGuardGeneration;
     private long lastAcceptedHitMs;
     private volatile long rawHits;
     private volatile long acceptedHits;
@@ -320,6 +322,11 @@ public final class WakeController implements AudioProbe.WakeListener, AudioState
             confirmVoice();
             return;
         }
+        if (AudioStateMonitor.hasOtherCaptureOrUnknown()) {
+            L.i("MIC_GUARD launch confirmation uncertain; capture busy or unknown");
+            pauseForCommunication();
+            return;
+        }
         if (!deeplinkTried) {
             deeplinkTried = true;
             L.i("VOICE_CONFIRM_TIMEOUT after=" + (SystemClock.elapsedRealtime() - launchStartedAt)
@@ -336,7 +343,7 @@ public final class WakeController implements AudioProbe.WakeListener, AudioState
     private void confirmVoice() {
         L.i("VOICE_CONFIRMED latencyMs=" + (SystemClock.elapsedRealtime() - launchStartedAt));
         set(State.VOICE_ACTIVE);
-        voiceEndCandidateSince = 0;
+        beginMicGuard();
     }
 
     // ---------------- audio state callbacks ----------------
@@ -354,13 +361,8 @@ public final class WakeController implements AudioProbe.WakeListener, AudioState
                     if (AudioStateMonitor.isVoiceConfirmed()) confirmVoice();
                     break;
                 case VOICE_ACTIVE:
-                    evaluateVoiceEnd();
-                    break;
                 case EXTERNAL_COMMUNICATION:
-                    if (!hasCommunication()) {
-                        L.i("EXTERNAL_COMMUNICATION ended");
-                        reacquire();
-                    }
+                    evaluateVoiceEnd();
                     break;
                 default:
                     break;
@@ -368,23 +370,42 @@ public final class WakeController implements AudioProbe.WakeListener, AudioState
         });
     }
 
+    /** Both wake-launched and manually launched calls get the same microphone guard. */
+    private void beginMicGuard() {
+        voiceEndCandidateSince = -1;
+        long generation = ++micGuardGeneration;
+        evaluateVoiceEnd();
+        later(() -> pollMicGuard(generation), MIC_GUARD_POLL_MS);
+    }
+
+    private boolean guardingMicrophone() {
+        return state == State.VOICE_ACTIVE || state == State.EXTERNAL_COMMUNICATION;
+    }
+
+    private void pollMicGuard(long generation) {
+        if (generation != micGuardGeneration || !guardingMicrophone()) return;
+        evaluateVoiceEnd();
+        if (generation == micGuardGeneration && guardingMicrophone()) {
+            later(() -> pollMicGuard(generation), MIC_GUARD_POLL_MS);
+        }
+    }
+
     private void evaluateVoiceEnd() {
-        boolean ended = !AudioStateMonitor.isCommunicationMode()
-                && !AudioStateMonitor.hasRealCommunicationCapture();
-        long now = SystemClock.elapsedRealtime();
-        if (!ended) {
-            voiceEndCandidateSince = 0;
+        if (hasCommunication()) {
+            if (voiceEndCandidateSince >= 0) L.i("MIC_GUARD idle interrupted; staying paused");
+            voiceEndCandidateSince = -1;
             return;
         }
-        if (voiceEndCandidateSince == 0) {
+        long now = SystemClock.elapsedRealtime();
+        if (voiceEndCandidateSince < 0) {
             voiceEndCandidateSince = now;
-            later(() -> {
-                if (state == State.VOICE_ACTIVE) evaluateVoiceEnd();
-            }, VOICE_END_DEBOUNCE_MS + 100);
+            L.i("MIC_GUARD idle candidate; waiting " + VOICE_END_DEBOUNCE_MS + "ms");
             return;
         }
         if (now - voiceEndCandidateSince >= VOICE_END_DEBOUNCE_MS) {
-            L.i("VOICE_ENDED");
+            L.i("MIC_GUARD idle confirmed state=" + state);
+            if (state == State.VOICE_ACTIVE) L.i("VOICE_ENDED");
+            else L.i("EXTERNAL_COMMUNICATION ended");
             reacquire();
         }
     }
@@ -407,6 +428,10 @@ public final class WakeController implements AudioProbe.WakeListener, AudioState
     /** Polls instead of waiting a fixed window, so recovery is bounded by the device, not a timer. */
     private void pollReacquire(long t0, int attempt) {
         if (state != State.KWS_REACQUIRING) return;
+        if (hasCommunication()) {
+            pauseForCommunication();
+            return;
+        }
         boolean running = AudioProbe.isRunning();
         boolean live = AudioStateMonitor.hasOwnLiveCapture();
         if (running && live) {
@@ -444,7 +469,8 @@ public final class WakeController implements AudioProbe.WakeListener, AudioState
 
     private static boolean hasCommunication() {
         return AudioStateMonitor.isCommunicationMode()
-                || AudioStateMonitor.hasRealCommunicationCapture();
+                || AudioStateMonitor.hasRealCommunicationCapture()
+                || AudioStateMonitor.hasOtherCaptureOrUnknown();
     }
 
     private void pauseForCommunication() {
@@ -452,6 +478,7 @@ public final class WakeController implements AudioProbe.WakeListener, AudioState
         AudioProbe.setFeeding(false);
         AudioProbe.stop();
         kws.releaseStream();
+        beginMicGuard();
     }
 
     private void fail(String reason, Throwable error) {

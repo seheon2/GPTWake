@@ -132,6 +132,20 @@ public final class AudioStateMonitor {
         return false;
     }
 
+    /**
+     * Android may anonymize other apps' recording configurations. Do not rely on a
+     * package name, audio source or silence flag to decide that the microphone is free.
+     * A missing snapshot is not evidence of an idle microphone.
+     */
+    public static boolean hasOtherCaptureOrUnknown() {
+        List<AudioRecordingConfiguration> cfgs = configs();
+        if (cfgs == null) return true;
+        for (AudioRecordingConfiguration c : cfgs) {
+            if (!isOwnCapture(c)) return true;
+        }
+        return false;
+    }
+
     public static boolean isCommunicationMode() {
         int m = mode();
         return m == AudioManager.MODE_IN_COMMUNICATION || m == AudioManager.MODE_IN_CALL;
